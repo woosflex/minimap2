@@ -38,6 +38,27 @@
 #define CALLOC(type, len) ((type*)calloc((len), sizeof(type)))
 #define REALLOC(type, ptr, cnt) ((type*)realloc((ptr), (cnt) * sizeof(type)))
 
+/*
+ * Index bucket. In the stock/khash backend and the traceon backend, `h` is the
+ * per-bucket hash table (idxhash_t* or kmerindex_t*) and `p` the position array
+ * for minimizers appearing >1 times. In the tcache-flat mode (mm_idx_t::is_tcache)
+ * `h` is NULL and `fe`/`ne` point directly at the mmap'd sorted (key,value) entry
+ * array (2*ne uint64s per bucket, sorted by key>>1 == minimizer high bits), so
+ * lookups are binary searches with zero table rebuild. Defined here (internal
+ * header) so mm_traceon_cache.c can lay the buckets out; minimap.h keeps the
+ * type opaque to external users.
+ */
+typedef struct mm_idx_bucket_s {
+	mm128_v a;   // (minimizer, position) array
+	int32_t n;   // size of the _p_ array
+	uint64_t *p; // position array for minimizers appearing >1 times
+	void *h;     // hash table indexing _p_ and minimizers appearing once
+#ifdef TRACEON_BACKEND
+	const uint64_t *fe; // tcache-flat: (key,value) pairs, sorted by key>>1 (NULL if empty)
+	int32_t ne;         // tcache-flat: number of entries in this bucket
+#endif
+} mm_idx_bucket_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -64,6 +85,7 @@ typedef struct {
 
 double cputime(void);
 double realtime(void);
+mm_idx_t *mm_idx_init(int w, int k, int b, int flag); // defined in index.c; internal
 long peakrss(void);
 
 void radix_sort_128x(mm128_t *beg, mm128_t *end);

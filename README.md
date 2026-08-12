@@ -427,3 +427,23 @@ mappy` or [from BioConda][mappyconda] via `conda install -c bioconda mappy`.
 [doi2]: https://doi.org/10.1093/bioinformatics/btab705
 [simde]: https://github.com/nemequ/simde
 [unimap]: https://github.com/lh3/unimap
+
+## TracEon build options (this fork)
+
+This fork adds two opt-in backends; plain `make` is byte-identical to upstream
+v2.31.
+
+* `make TRACEON=1` — backs minimap2's per-bucket khash minimizer table with
+  TracEon's `traceon_kmer` C API. The final link is driven by `$(CXX)`.
+* `make TCACHE=1` — alias for `TRACEON=1` that additionally enables the TRC1
+  `.tcache` flat-array cache (`mm_traceon_cache.c` + the CRC32C shim
+  `mm_traceon_crc.cpp`): `minimap2 -d ref.tcache ref.fa` writes each bucket's
+  minimizer entries as sorted flat arrays with cumulative offset tables and a
+  whole-file CRC32C trailer; `minimap2 ref.tcache reads.fq` mmap()s the file,
+  verifies the CRC, and points the index at the mapped arrays — zero table
+  rebuild, binary-search lookups. The byte layout is documented at the top of
+  `mm_traceon_cache.c`.
+
+A `.build_flags` stamp makes the Makefile rebuild all objects whenever the
+compile flags change, so switching modes with `make` / `make TRACEON=1` /
+`make TCACHE=1` always produces the right binary.

@@ -7,6 +7,9 @@
 #endif
 #include <fcntl.h>
 #include <stdio.h>
+#ifdef TRACEON_BACKEND
+#include <sys/mman.h> // munmap for the tcache-flat load
+#endif
 #define __STDC_LIMIT_MACROS
 #include "kthread.h"
 #include "bseq.h"
@@ -29,12 +32,8 @@ KHASH_MAP_INIT_STR(str, uint32_t)
 
 #define kroundup64(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, (x)|=(x)>>32, ++(x))
 
-typedef struct mm_idx_bucket_s {
-	mm128_v a;   // (minimizer, position) array
-	int32_t n;   // size of the _p_ array
-	uint64_t *p; // position array for minimizers appearing >1 times
-	void *h;     // hash table indexing _p_ and minimizers appearing once
-} mm_idx_bucket_t;
+// mm_idx_bucket_t is defined in mmpriv.h (internal header) so that
+// mm_traceon_cache.c can lay the buckets out directly.
 
 typedef struct {
 	int32_t st, en, cnt;
@@ -83,6 +82,12 @@ void mm_idx_destroy(mm_idx_t *mi)
 	if (mi == 0) return;
 	if (mi->h) kh_destroy(str, (khash_t(str)*)mi->h);
 	if (mi->B) {
+#ifdef TRACEON_BACKEND
+		if (mi->is_tcache) {
+			// Flat mode: every bucket array (p, fe) and mi->S live inside the
+			// mmap'd tcache region; nothing per-bucket is heap-owned.
+		} else
+#endif
 		for (i = 0; i < 1U<<mi->b; ++i) {
 			free(mi->B[i].p);
 			free(mi->B[i].a.a);
@@ -109,6 +114,12 @@ void mm_idx_destroy(mm_idx_t *mi)
 			free(mi->seq[i].name);
 		free(mi->seq);
 	} else km_destroy(mi->km);
+#ifdef TRACEON_BACKEND
+	if (mi->is_tcache) {
+		if (mi->tcache_map) munmap(mi->tcache_map, mi->tcache_size);
+		mi->S = 0; // points into the mmap; skip the free() below
+	}
+#endif
 	free(mi->B); free(mi->S); free(mi);
 }
 
@@ -118,6 +129,29 @@ const uint64_t *mm_idx_get(const mm_idx_t *mi, uint64_t minier, int *n)
 	mm_idx_bucket_t *b = &mi->B[minier&mask];
 	void *h = b->h; // bucket handle: idxhash_t* (stock) or kmerindex_t* (traceon)
 	*n = 0;
+#ifdef TRACEON_BACKEND
+	if (mi->is_tcache) { // flat mode: binary search in the bucket's sorted (key,value) array
+		const uint64_t *fe = b->fe;
+		if (fe == 0) return 0;
+		{
+			uint64_t key = minier>>mi->b; // == stored_key>>1 (the singleton bit is ignored, like idx_eq)
+			int32_t lo = 0, hi = b->ne;
+			while (lo < hi) {
+				int32_t mid = lo + ((hi - lo) >> 1);
+				if ((fe[mid<<1]>>1) < key) lo = mid + 1;
+				else hi = mid;
+			}
+			if (lo >= b->ne || (fe[lo<<1]>>1) != key) return 0; // miss
+			if (fe[lo<<1]&1) { // special casing when there is only one k-mer
+				*n = 1;
+				return &fe[(lo<<1)+1];
+			} else {
+				*n = (uint32_t)fe[(lo<<1)+1];
+				return &b->p[fe[(lo<<1)+1]>>32];
+			}
+		}
+	}
+#endif
 	if (h == 0) return 0;
 #ifdef TRACEON_BACKEND
 	{
@@ -157,7 +191,12 @@ void mm_idx_stat(const mm_idx_t *mi)
 	fprintf(stderr, "[M::%s] kmer size: %d; skip: %d; is_hpc: %d; #seq: %d\n", __func__, mi->k, mi->w, mi->flag&MM_I_HPC, mi->n_seq);
 	for (i = 0; i < mi->n_seq; ++i)
 		len += mi->seq[i].len;
-	for (i = 0; i < 1U<<mi->b; ++i)
+	for (i = 0; i < 1U<<mi->b; ++i) {
+#ifdef TRACEON_BACKEND
+		if (mi->is_tcache) {
+			if (mi->B[i].fe) n += mi->B[i].ne;
+		} else
+#endif
 		if (mi->B[i].h) {
 #ifdef TRACEON_BACKEND
 			n += (int64_t)kmerindex_size((const kmerindex_t*)mi->B[i].h);
@@ -165,7 +204,19 @@ void mm_idx_stat(const mm_idx_t *mi)
 			n += kh_size((idxhash_t*)mi->B[i].h);
 #endif
 		}
+	}
 	for (i = 0; i < 1U<<mi->b; ++i) {
+#ifdef TRACEON_BACKEND
+		if (mi->is_tcache) {
+			const uint64_t *fe = mi->B[i].fe;
+			int32_t j;
+			if (fe == 0) continue;
+			for (j = 0; j < mi->B[i].ne; ++j) {
+				sum += fe[j<<1]&1? 1 : (uint32_t)fe[(j<<1)+1];
+				if (fe[j<<1]&1) ++n1;
+			}
+		} else
+#endif
 		if (mi->B[i].h == 0) continue;
 #ifdef TRACEON_BACKEND
 		{
@@ -262,7 +313,12 @@ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f)
 	uint32_t thres;
 	uint32_t *a;
 	if (f <= 0.) return INT32_MAX;
-	for (i = 0; i < 1<<mi->b; ++i)
+	for (i = 0; i < 1<<mi->b; ++i) {
+#ifdef TRACEON_BACKEND
+		if (mi->is_tcache) {
+			if (mi->B[i].fe) n += mi->B[i].ne;
+		} else
+#endif
 		if (mi->B[i].h) {
 #ifdef TRACEON_BACKEND
 			n += kmerindex_size((const kmerindex_t*)mi->B[i].h);
@@ -270,9 +326,19 @@ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f)
 			n += kh_size((idxhash_t*)mi->B[i].h);
 #endif
 		}
+	}
 	if (n == 0) return INT32_MAX;
 	a = (uint32_t*)malloc(n * 4);
 	for (i = n = 0; i < 1<<mi->b; ++i) {
+#ifdef TRACEON_BACKEND
+		if (mi->is_tcache) {
+			const uint64_t *fe = mi->B[i].fe;
+			int32_t j;
+			if (fe == 0) continue;
+			for (j = 0; j < mi->B[i].ne; ++j)
+				a[n++] = fe[j<<1]&1? 1 : (uint32_t)fe[(j<<1)+1];
+		} else
+#endif
 		if (mi->B[i].h == 0) continue;
 #ifdef TRACEON_BACKEND
 		{
@@ -593,6 +659,55 @@ mm_idx_t *mm_idx_str(int w, int k, int is_hpc, int bucket_bits, int n, const cha
  * index I/O *
  *************/
 
+#ifdef TRACEON_BACKEND
+// Rebuild a transient khash bucket from bucket i's entries in SORTED key order
+// (the order upstream inserts into khash after radix sorting b->a), so the .mmi
+// bytes we write are identical to stock for BOTH the traceon-table backend and
+// the tcache-flat backend. Returns NULL (with *size_out=0) for an empty bucket.
+// The caller destroys the returned khash.
+static idxhash_t *mm_idx_bucket_khash(const mm_idx_t *mi, uint32_t i, uint32_t *size_out)
+{
+	mm_idx_bucket_t *b = &mi->B[i];
+	idxhash_t *h = 0;
+	uint32_t size = 0;
+	*size_out = 0;
+	if (mi->is_tcache) {
+		if (b->fe == 0) return 0;
+		size = (uint32_t)b->ne;
+		if (size == 0) return 0;
+		h = kh_init(idx);
+		kh_resize(idx, h, size);
+		{
+			uint32_t j;
+			for (j = 0; j < size; ++j) {
+				khint_t k;
+				int absent;
+				k = kh_put(idx, h, b->fe[j<<1], &absent);
+				assert(absent);
+				kh_val(h, k) = b->fe[(j<<1)+1];
+			}
+		}
+	} else if (b->h) {
+		kmerindex_iter_t it;
+		uint64_t kk, vv;
+		size = (uint32_t)kmerindex_size((const kmerindex_t*)b->h);
+		if (size == 0) return 0;
+		h = kh_init(idx);
+		kh_resize(idx, h, size);
+		kmerindex_iter_begin((const kmerindex_t*)b->h, &it);
+		while (kmerindex_iter_next(&it, &kk, &vv)) {
+			khint_t k;
+			int absent;
+			k = kh_put(idx, h, kk, &absent);
+			assert(absent);
+			kh_val(h, k) = vv;
+		}
+	}
+	*size_out = size;
+	return h;
+}
+#endif
+
 void mm_idx_dump(FILE *fp, const mm_idx_t *mi)
 {
 	uint64_t sum_len = 0;
@@ -617,28 +732,15 @@ void mm_idx_dump(FILE *fp, const mm_idx_t *mi)
 		mm_idx_bucket_t *b = &mi->B[i];
 		khint_t k;
 #ifdef TRACEON_BACKEND
-		// The traceon table is not byte-compatible with khash's slot layout, so
-		// rebuild a khash bucket from the traceon entries and write it exactly
-		// as upstream does: the .mmi stream keeps the SAME record format as
-		// stock (logical key/value pairs), and stock binaries can load it.
-		idxhash_t *h = 0;
-		uint32_t size = 0;
-		if (b->h) {
-			kmerindex_iter_t it;
-			uint64_t kk, vv;
-			size = (uint32_t)kmerindex_size((const kmerindex_t*)b->h);
-			if (size) {
-				int absent;
-				h = kh_init(idx);
-				kh_resize(idx, h, size);
-				kmerindex_iter_begin((const kmerindex_t*)b->h, &it);
-				while (kmerindex_iter_next(&it, &kk, &vv)) {
-					k = kh_put(idx, h, kk, &absent);
-					assert(absent);
-					kh_val(h, k) = vv;
-				}
-			}
-		}
+		// The traceon table (and the tcache-flat array) are not byte-compatible
+		// with khash's slot layout, so rebuild a khash bucket from the logical
+		// entries and write it exactly as upstream does: the .mmi stream keeps
+		// the SAME record format as stock (logical key/value pairs), and stock
+		// binaries can load it. Insert order == sorted key order, so the bytes
+		// match stock.
+		idxhash_t *h;
+		uint32_t size;
+		h = mm_idx_bucket_khash(mi, i, &size);
 #else
 		idxhash_t *h = (idxhash_t*)b->h;
 		uint32_t size = h? h->size : 0;
@@ -769,12 +871,40 @@ int64_t mm_idx_is_idx(const char *fn)
 		lseek(fd, 0, SEEK_SET);
 #endif // WIN32
 		ret = read(fd, magic, 4);
-		if (ret == 4 && strncmp(magic, MM_IDX_MAGIC, 4) == 0)
+		if (ret == 4 && (strncmp(magic, MM_IDX_MAGIC, 4) == 0
+#ifdef TRACEON_BACKEND
+		                 || strncmp(magic, MM_TCACHE_MAGIC, 4) == 0
+#endif
+		                ))
 			is_idx = 1;
 	}
 	close(fd);
 	return is_idx? off_end : 0;
 }
+
+#ifdef TRACEON_BACKEND
+// True if the file begins with the TRC1 tcache magic (only called when
+// mm_idx_is_idx() already accepted the file).
+static int mm_idx_is_tcache(const char *fn)
+{
+	int fd, ret = 0;
+	char magic[4];
+	fd = open(fn, O_RDONLY);
+	if (fd >= 0) {
+		if (read(fd, magic, 4) == 4 && strncmp(magic, MM_TCACHE_MAGIC, 4) == 0)
+			ret = 1;
+		close(fd);
+	}
+	return ret;
+}
+
+// True if fn ends in ".tcache" (the -d save-path trigger for the flat cache).
+static int mm_is_tcache_name(const char *fn)
+{
+	size_t l = strlen(fn);
+	return l >= 7 && strcmp(fn + l - 7, ".tcache") == 0;
+}
+#endif
 
 mm_idx_reader_t *mm_idx_reader_open(const char *fn, const mm_idxopt_t *opt, const char *fn_out)
 {
@@ -789,8 +919,16 @@ mm_idx_reader_t *mm_idx_reader_open(const char *fn, const mm_idxopt_t *opt, cons
 	if (r->is_idx) {
 		r->fp.idx = fopen(fn, "rb");
 		r->idx_size = is_idx;
+#ifdef TRACEON_BACKEND
+		r->is_tcache = mm_idx_is_tcache(fn);
+#endif
 	} else r->fp.seq = mm_bseq_open(fn);
-	if (fn_out) r->fp_out = fopen(fn_out, "wb");
+	if (fn_out) {
+		r->fp_out = fopen(fn_out, "wb");
+#ifdef TRACEON_BACKEND
+		if (r->fp_out && mm_is_tcache_name(fn_out)) r->tcache_out = 1;
+#endif
+	}
 	return r;
 }
 
@@ -806,13 +944,22 @@ mm_idx_t *mm_idx_reader_read(mm_idx_reader_t *r, int n_threads)
 {
 	mm_idx_t *mi;
 	if (r->is_idx) {
+#ifdef TRACEON_BACKEND
+		if (r->is_tcache) mi = mm_tcache_load(r->fp.idx);
+		else
+#endif
 		mi = mm_idx_load(r->fp.idx);
 		if (mi && mm_verbose >= 2 && (mi->k != r->opt.k || mi->w != r->opt.w || (mi->flag&MM_I_HPC) != (r->opt.flag&MM_I_HPC)))
 			fprintf(stderr, "[WARNING]\033[1;31m Indexing parameters (-k, -w or -H) overridden by parameters used in the prebuilt index.\033[0m\n");
 	} else
 		mi = mm_idx_gen(r->fp.seq, r->opt.w, r->opt.k, r->opt.bucket_bits, r->opt.flag, r->opt.mini_batch_size, n_threads, r->opt.batch_size);
 	if (mi) {
+#ifdef TRACEON_BACKEND
+		if (r->fp_out && r->tcache_out) mm_tcache_dump(r->fp_out, mi);
+		else if (r->fp_out) mm_idx_dump(r->fp_out, mi);
+#else
 		if (r->fp_out) mm_idx_dump(r->fp_out, mi);
+#endif
 		mi->index = r->n_parts++;
 	}
 	return mi;

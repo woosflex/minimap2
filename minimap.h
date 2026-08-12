@@ -54,6 +54,7 @@
 #define MM_I_NO_NAME      0x4
 
 #define MM_IDX_MAGIC   "MMI\2"
+#define MM_TCACHE_MAGIC "TRC1"
 
 #define MM_MAX_SEG       255
 
@@ -93,6 +94,11 @@ typedef struct {
 	mm_idx_seq_t *seq;         // sequence name, length and offset
 	uint32_t *S;               // 4-bit packed sequence
 	struct mm_idx_bucket_s *B; // index (hidden)
+#ifdef TRACEON_BACKEND
+	void *tcache_map;          // mmap'd ".tcache" flat-array cache (owned; NULL unless is_tcache)
+	int64_t tcache_size;       // size of tcache_map (for munmap)
+	uint8_t is_tcache;         // 1 = buckets are sorted flat arrays inside tcache_map (zero-rebuild load)
+#endif
 	struct mm_idx_intv_s *I;   // intervals (hidden)
 	struct mm_idx_spsc_s *spsc;// splice score (hidden)
 	struct mm_idx_jjump_s *J;  // junctions to create jumps (hidden)
@@ -201,6 +207,10 @@ typedef struct {
 		struct mm_bseq_file_s *seq;
 		FILE *idx;
 	} fp;
+#ifdef TRACEON_BACKEND
+	int is_tcache;   // input is a TRC1 ".tcache" file (flat-array cache, TracEon backend)
+	int tcache_out;  // -d target file name ends in ".tcache"
+#endif
 } mm_idx_reader_t;
 
 // memory buffer for thread-local storage during mapping
@@ -307,6 +317,23 @@ mm_idx_t *mm_idx_load(FILE *fp);
  * @param mi         minimap2 index
  */
 void mm_idx_dump(FILE *fp, const mm_idx_t *mi);
+
+#ifdef TRACEON_BACKEND
+/**
+ * Save the index in the TRC1 ".tcache" flat-array cache format (zero-rebuild,
+ * mmap-loadable; see mm_traceon_cache.c for the byte layout). Only available in
+ * TRACEON builds. Returns 0 on success, -1 on I/O error.
+ */
+int mm_tcache_dump(FILE *fp, const mm_idx_t *mi);
+
+/**
+ * Load a TRC1 ".tcache" file: mmap, verify the whole-file CRC32C trailer, and
+ * point the index structures (buckets, p arrays, packed sequence) directly at
+ * the mapped arrays. No table rebuild, no inserts. Returns NULL on any error
+ * (bad magic/version/CRC/size) or I/O failure.
+ */
+mm_idx_t *mm_tcache_load(FILE *fp);
+#endif
 
 /**
  * Create an index from strings in memory
