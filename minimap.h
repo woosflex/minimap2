@@ -210,6 +210,7 @@ typedef struct {
 #ifdef TRACEON_BACKEND
 	int is_tcache;   // input is a TRC1 ".tcache" file (flat-array cache, TracEon backend)
 	int tcache_out;  // -d target file name ends in ".tcache"
+	char *fn_out;    // -d target path (owned; used to unlink a truncated tcache on dump failure)
 #endif
 } mm_idx_reader_t;
 

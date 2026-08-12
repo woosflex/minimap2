@@ -926,7 +926,10 @@ mm_idx_reader_t *mm_idx_reader_open(const char *fn, const mm_idxopt_t *opt, cons
 	if (fn_out) {
 		r->fp_out = fopen(fn_out, "wb");
 #ifdef TRACEON_BACKEND
-		if (r->fp_out && mm_is_tcache_name(fn_out)) r->tcache_out = 1;
+		if (r->fp_out && mm_is_tcache_name(fn_out)) {
+			r->tcache_out = 1;
+			r->fn_out = strdup(fn_out);
+		}
 #endif
 	}
 	return r;
@@ -937,6 +940,9 @@ void mm_idx_reader_close(mm_idx_reader_t *r)
 	if (r->is_idx) fclose(r->fp.idx);
 	else mm_bseq_close(r->fp.seq);
 	if (r->fp_out) fclose(r->fp_out);
+#ifdef TRACEON_BACKEND
+	free(r->fn_out);
+#endif
 	free(r);
 }
 
@@ -955,8 +961,13 @@ mm_idx_t *mm_idx_reader_read(mm_idx_reader_t *r, int n_threads)
 		mi = mm_idx_gen(r->fp.seq, r->opt.w, r->opt.k, r->opt.bucket_bits, r->opt.flag, r->opt.mini_batch_size, n_threads, r->opt.batch_size);
 	if (mi) {
 #ifdef TRACEON_BACKEND
-		if (r->fp_out && r->tcache_out) mm_tcache_dump(r->fp_out, mi);
-		else if (r->fp_out) mm_idx_dump(r->fp_out, mi);
+		if (r->fp_out && r->tcache_out) {
+			if (mm_tcache_dump(r->fp_out, mi) != 0) {
+				fprintf(stderr, "[ERROR] failed to write the tcache file: the dump aborted partway (short write, e.g. disk/quota full). The output is truncated and will not load; delete it and retry with free space\n");
+				if (r->fn_out) remove(r->fn_out); // never leave a truncated file that later fails with a cryptic CRC error
+				exit(EXIT_FAILURE);
+			}
+		} else if (r->fp_out) mm_idx_dump(r->fp_out, mi);
 #else
 		if (r->fp_out) mm_idx_dump(r->fp_out, mi);
 #endif

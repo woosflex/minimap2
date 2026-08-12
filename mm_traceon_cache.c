@@ -319,7 +319,21 @@ int mm_tcache_dump(FILE *fp, const mm_idx_t *mi)
 		uint32_t c = mm_crc32c_final(crc);
 		if (fwrite(&c, 4, 1, fp) != 1) goto fail;
 	}
-	fflush(fp);
+	/* Flush and verify that the trailer is the LAST 4 bytes of the PHYSICAL
+	 * file. A short or deferred write (e.g. ENOSPC / per-user tmpfs quota when
+	 * the reference is large) silently leaves a truncated file whose tail is
+	 * bucket data and whose "stored CRC" reads as garbage — the loader then
+	 * reports a cryptic CRC32C mismatch. Detect it here, at write time, and
+	 * return failure so the caller can abort instead of shipping the file. */
+	if (fflush(fp) != 0 || ferror(fp)) goto fail;
+	{
+		struct stat st;
+		if (fstat(fileno(fp), &st) != 0 || (uint64_t)st.st_size != L.payload_size + 4) {
+			fprintf(stderr, "[ERROR] mm_tcache_dump: write truncated (%lld of %llu bytes on disk) — the tcache file is invalid; delete it and retry with free space\n",
+				(long long)st.st_size, (unsigned long long)(L.payload_size + 4));
+			goto fail;
+		}
+	}
 	mm_crc32c_free(crc);
 	free(ecount); free(pcount);
 	return 0;
