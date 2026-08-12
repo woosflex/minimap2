@@ -54,7 +54,7 @@
 #define MM_I_NO_NAME      0x4
 
 #define MM_IDX_MAGIC   "MMI\2"
-#define MM_TCACHE_MAGIC "TRC1"
+#define MM_TCACHE_MAGIC "TRC2"
 
 #define MM_MAX_SEG       255
 
@@ -95,9 +95,9 @@ typedef struct {
 	uint32_t *S;               // 4-bit packed sequence
 	struct mm_idx_bucket_s *B; // index (hidden)
 #ifdef TRACEON_BACKEND
-	void *tcache_map;          // mmap'd ".tcache" flat-array cache (owned; NULL unless is_tcache)
+	void *tcache_map;          // mmap'd ".tcache" open-addressing cache (owned; NULL unless is_tcache)
 	int64_t tcache_size;       // size of tcache_map (for munmap)
-	uint8_t is_tcache;         // 1 = buckets are sorted flat arrays inside tcache_map (zero-rebuild load)
+	uint8_t is_tcache;         // 1 = buckets are open-addressing slot arrays inside tcache_map (zero-rebuild load)
 #endif
 	struct mm_idx_intv_s *I;   // intervals (hidden)
 	struct mm_idx_spsc_s *spsc;// splice score (hidden)
@@ -208,7 +208,7 @@ typedef struct {
 		FILE *idx;
 	} fp;
 #ifdef TRACEON_BACKEND
-	int is_tcache;   // input is a TRC1 ".tcache" file (flat-array cache, TracEon backend)
+	int is_tcache;   // input is a TRC2 ".tcache" file (open-addressing cache, TracEon backend)
 	int tcache_out;  // -d target file name ends in ".tcache"
 	char *fn_out;    // -d target path (owned; used to unlink a truncated tcache on dump failure)
 #endif
@@ -321,14 +321,14 @@ void mm_idx_dump(FILE *fp, const mm_idx_t *mi);
 
 #ifdef TRACEON_BACKEND
 /**
- * Save the index in the TRC1 ".tcache" flat-array cache format (zero-rebuild,
- * mmap-loadable; see mm_traceon_cache.c for the byte layout). Only available in
- * TRACEON builds. Returns 0 on success, -1 on I/O error.
+ * Save the index in the TRC2 ".tcache" open-addressing cache format
+ * (zero-rebuild, mmap-loadable; see mm_traceon_cache.c for the byte layout).
+ * Only available in TRACEON builds. Returns 0 on success, -1 on I/O error.
  */
 int mm_tcache_dump(FILE *fp, const mm_idx_t *mi);
 
 /**
- * Load a TRC1 ".tcache" file: mmap, verify the whole-file CRC32C trailer, and
+ * Load a TRC2 ".tcache" file: mmap, verify the whole-file CRC32C trailer, and
  * point the index structures (buckets, p arrays, packed sequence) directly at
  * the mapped arrays. No table rebuild, no inserts. Returns NULL on any error
  * (bad magic/version/CRC/size) or I/O failure.

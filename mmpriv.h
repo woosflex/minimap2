@@ -41,10 +41,15 @@
 /*
  * Index bucket. In the stock/khash backend and the traceon backend, `h` is the
  * per-bucket hash table (idxhash_t* or kmerindex_t*) and `p` the position array
- * for minimizers appearing >1 times. In the tcache-flat mode (mm_idx_t::is_tcache)
- * `h` is NULL and `fe`/`ne` point directly at the mmap'd sorted (key,value) entry
- * array (2*ne uint64s per bucket, sorted by key>>1 == minimizer high bits), so
- * lookups are binary searches with zero table rebuild. Defined here (internal
+ * for minimizers appearing >1 times. In the tcache v2 mode (mm_idx_t::is_tcache)
+ * `h` is NULL and the bucket is an open-addressing table mmap'd straight out of
+ * the .tcache file: `fe` is the slot array (capacity*2 u64s, (key,value)
+ * interleaved), `bm` the occupancy bitmap (bit i = slot i occupied; EMPTY slots
+ * are represented by the bitmap only — keys may be any u64, no sentinel), `cap`
+ * the power-of-two capacity and `ne` the number of occupied slots. Lookups are
+ * hash probes: idx = (key>>1) & (cap-1), linear probing while the bitmap bit is
+ * set, comparing (slot_key>>1) == (key>>1) — exact khash idx_hash/idx_eq
+ * semantics, so the singleton flag in bit0 is ignored. Defined here (internal
  * header) so mm_traceon_cache.c can lay the buckets out; minimap.h keeps the
  * type opaque to external users.
  */
@@ -54,8 +59,10 @@ typedef struct mm_idx_bucket_s {
 	uint64_t *p; // position array for minimizers appearing >1 times
 	void *h;     // hash table indexing _p_ and minimizers appearing once
 #ifdef TRACEON_BACKEND
-	const uint64_t *fe; // tcache-flat: (key,value) pairs, sorted by key>>1 (NULL if empty)
-	int32_t ne;         // tcache-flat: number of entries in this bucket
+	const uint64_t *fe; // tcache v2: open-addressing slot array (capacity*2 u64s, NULL if empty)
+	const uint8_t *bm;  // tcache v2: occupancy bitmap, ceil(capacity/8) bytes (NULL if empty)
+	uint32_t cap;       // tcache v2: table capacity (power of two; 0 if empty)
+	int32_t ne;         // tcache v2: number of occupied slots (== entry count)
 #endif
 } mm_idx_bucket_t;
 

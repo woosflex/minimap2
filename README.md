@@ -435,13 +435,14 @@ v2.31.
 
 * `make TRACEON=1` — backs minimap2's per-bucket khash minimizer table with
   TracEon's `traceon_kmer` C API. The final link is driven by `$(CXX)`.
-* `make TCACHE=1` — alias for `TRACEON=1` that additionally enables the TRC1
-  `.tcache` flat-array cache (`mm_traceon_cache.c` + the CRC32C shim
+* `make TCACHE=1` — alias for `TRACEON=1` that additionally enables the TRC2
+  `.tcache` open-addressing cache (`mm_traceon_cache.c` + the CRC32C shim
   `mm_traceon_crc.cpp`): `minimap2 -d ref.tcache ref.fa` writes each bucket's
-  minimizer entries as sorted flat arrays with cumulative offset tables and a
-  whole-file CRC32C trailer; `minimap2 ref.tcache reads.fq` mmap()s the file,
-  verifies the CRC, and points the index at the mapped arrays — zero table
-  rebuild, binary-search lookups. The byte layout is documented at the top of
+  minimizer entries as a khash-style open-addressing slot array with an
+  occupancy bitmap plus cumulative offset tables and a whole-file CRC32C
+  trailer; `minimap2 ref.tcache reads.fq` mmap()s the file, verifies the CRC,
+  and points the index at the mapped arrays — zero table rebuild, O(1) hash
+  lookup (no binary search). The byte layout is documented at the top of
   `mm_traceon_cache.c`.
 
 A `.build_flags` stamp makes the Makefile rebuild all objects whenever the

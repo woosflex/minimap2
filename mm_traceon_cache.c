@@ -1,29 +1,38 @@
 /*
- * mm_traceon_cache.c — TRC1 ".tcache" flat-array index cache (TracEon backend)
+ * mm_traceon_cache.c — TRC2 ".tcache" open-addressing index cache (TracEon backend)
  *
  * OPT-IN, additive cache mode for RECURRING runs: alongside the stock khash
  * backend (plain `make`) and the traceon table backend (`make TRACEON=1`),
- * this file implements a third, mmap-loadable flat format that eliminates the
- * load-time table rebuild entirely. Both khash and traceon REBUILD their
- * per-bucket tables on load (every .mmi record is inserted into a hash table);
- * a .tcache file instead stores each bucket's minimizer entries as a SORTED
- * flat (key,value) array plus cumulative offset tables, so loading is: mmap +
- * one whole-file CRC32C check + pointer fixups. No inserts, no table rebuild,
- * no khash/traceon objects. Lookups use binary search inside the bucket
- * (O(log n) per minimizer) and reproduce the exact khash semantics
- * (idx_hash/idx_eq ignore key bit 0 — the "singleton" flag — so a lookup
- * with bit0=0 finds an entry stored with bit0=1; values are packed exactly as
- * khash stores them: singleton -> position u64, multi -> (start_p<<32)|n).
+ * this file implements a third, mmap-loadable open-addressing format that
+ * eliminates the load-time table rebuild entirely. Both khash and traceon
+ * REBUILD their per-bucket tables on load (every .mmi record is inserted into
+ * a hash table); a .tcache file instead stores each bucket's minimizer
+ * entries as a khash-style open-addressing slot array (with a separate
+ * occupancy bitmap), plus cumulative offset tables, so loading is: mmap + one
+ * whole-file CRC32C check + pointer fixups. No inserts, no table rebuild, no
+ * khash/traceon objects. Lookups are hash probes (O(1) expected, like khash)
+ * and reproduce the exact khash semantics (idx_hash/idx_eq ignore key bit 0 —
+ * the "singleton" flag — so a lookup with bit0=0 finds an entry stored with
+ * bit0=1; values are packed exactly as khash stores them: singleton ->
+ * position u64, multi -> (start_p<<32)|n).
+ *
+ * v2 vs v1: v1 stored each bucket as a FLAT SORTED (key,value) array and
+ * looked entries up with binary search (O(log n) per minimizer), which at
+ * 250Mb reference scale measured ~0.5s slower than khash's O(1) during
+ * mapping — eating the load-time win. v2 replaces the sorted array with a
+ * khash-style open-addressing table (slot array + occupancy bitmap), which is
+ * still mmap-loadable with zero inserts AND gives O(1) hash lookup. v1 files
+ * are NOT loadable (format version bumped; a clear error names the fix).
  *
  * The format is only compiled into TRACEON builds (same TRACEON_BACKEND
  * guard as the traceon table backend); the stock build never sees it.
  *
  * ---------------------------------------------------------------------------
- * TRC1 FILE FORMAT (little-endian, host byte order — same convention as .mmi)
+ * TRC2 FILE FORMAT (little-endian, host byte order — same convention as .mmi)
  * ---------------------------------------------------------------------------
  *   Header (72 bytes):
- *     u32  magic     "TRC1"
- *     u16  version   1
+ *     u32  magic     "TRC2"
+ *     u16  version   2
  *     u16  flags     bit0 has_seq, bit1 has_names (mirrors the stored MM_I_* flags)
  *     i32  w         minimizer window
  *     i32  k         minimizer k-mer size
@@ -49,11 +58,20 @@
  *   Table block (zero-rebuild, mmap-pointable):
  *     p_off   (n_bucket+1) * u64 cumulative counts of p-array entries
  *             (p_off[0]=0; bucket i's p array = p_blob[p_off[i]..p_off[i+1]))
- *     e_off   (n_bucket+1) * u64 cumulative counts of (key,value) entries
- *             (bucket i's entries = entries[e_off[i]..e_off[i+1]))
- *     entries n_entry * (u64 key, u64 value), per-bucket CONTIGUOUS and SORTED
- *             by key>>1 (raw key order == key>>1 order, since every bucket has
- *             at most one entry per key>>1). Binary-searchable per bucket.
+ *     b_off   (n_bucket+1) * u64 cumulative BYTE offsets into the bucket blob
+ *             (b_off[0]=0; bucket i's table = b_blob[b_off[i]..b_off[i+1]));
+ *             the total bucket-blob size is b_off[n_bucket]
+ *     b_blob  per-bucket open-addressing tables, concatenated; empty buckets
+ *             contribute ZERO bytes (b_off[i+1] == b_off[i]). Each non-empty
+ *             table is, in order:
+ *               u32  capacity   power of two, >= 8; load factor (n/capacity)
+ *                               <= 0.75 at dump time
+ *               u32  pad        0
+ *               slots  capacity * 16 bytes: capacity (u64 key, u64 value)
+ *                               pairs, interleaved; empty slots are ANY bytes
+ *                               (written as 0) — occupancy lives ONLY in the
+ *                               bitmap, keys may be any u64 (no sentinel)
+ *               bitmap ceil(capacity/8) bytes: bit i = 1 iff slot i occupied
  *     p_blob  p_total * u64 concatenated per-bucket position arrays (each
  *             bucket's is already sorted by position, as in the khash build)
  *
@@ -72,7 +90,7 @@
  *   ./minimap2 -d ref.tcache ref.fa          # one-time build (slow path)
  *   ./minimap2 ref.tcache reads.fq           # recurring runs: ~zero-rebuild
  *
- * `.tcache` extension on -d selects the format; a TRC1 magic on input selects
+ * `.tcache` extension on -d selects the format; a TRC2 magic on input selects
  * the loader. Both are dispatched from index.c (mm_idx_reader_*).
  */
 
@@ -90,7 +108,6 @@
 
 #include "minimap.h"
 #include "mmpriv.h"
-#include "ksort.h"
 #include "kalloc.h" // kmalloc/kcalloc (NULL km falls back to malloc/calloc)
 #include "kmerindex_c_api.h"
 
@@ -104,8 +121,8 @@ void mm_crc32c_update(mm_crc32c_s *s, const void *data, size_t len);
 uint32_t mm_crc32c_final(mm_crc32c_s *s);
 uint32_t mm_crc32c(const void *data, size_t len);
 
-#define TCACHE_MAGIC     "TRC1"
-#define TCACHE_VERSION   1
+#define TCACHE_MAGIC     "TRC2"
+#define TCACHE_VERSION   2
 #define TCACHE_HDR_SIZE  72
 
 #define TCACHE_F_HAS_SEQ   0x1
@@ -134,15 +151,16 @@ typedef struct {
 	uint64_t s_off;      // packed reference (S) blob
 	uint64_t s_size;     // bytes of S blob
 	uint64_t poff_off;   // (n_bucket+1) * u64 cumulative p counts
-	uint64_t eoff_off;   // (n_bucket+1) * u64 cumulative entry counts
-	uint64_t ent_off;    // n_entry * 16 bytes (key,value)
+	uint64_t boff_off;   // (n_bucket+1) * u64 cumulative bucket-blob byte offsets
+	uint64_t bblob_off;  // bucket tables blob
+	uint64_t bblob_size; // bytes of the bucket tables blob
 	uint64_t pblob_off;  // p_total * 8 bytes
 	uint64_t payload_size; // == file size minus the 4-byte CRC trailer
 } tcache_layout_t;
 
 static void tcache_calc_layout(uint64_t sum_len, uint32_t has_seq, uint32_t n_seq,
                                uint64_t names_len, uint32_t n_bucket,
-                               uint64_t n_entry, uint64_t p_total,
+                               uint64_t bblob_size, uint64_t p_total,
                                tcache_layout_t *L)
 {
 	L->names_off = TCACHE_HDR_SIZE;
@@ -150,9 +168,10 @@ static void tcache_calc_layout(uint64_t sum_len, uint32_t has_seq, uint32_t n_se
 	L->s_off = L->lens_off + (uint64_t)n_seq * 4;
 	L->s_size = has_seq? ((sum_len + 7) / 8) * 4 : 0;
 	L->poff_off = (L->s_off + L->s_size + 7) & ~(uint64_t)7;
-	L->eoff_off = L->poff_off + (uint64_t)(n_bucket + 1) * 8;
-	L->ent_off = L->eoff_off + (uint64_t)(n_bucket + 1) * 8;
-	L->pblob_off = L->ent_off + n_entry * 16;
+	L->boff_off = L->poff_off + (uint64_t)(n_bucket + 1) * 8;
+	L->bblob_off = L->boff_off + (uint64_t)(n_bucket + 1) * 8;
+	L->bblob_size = bblob_size;
+	L->pblob_off = L->bblob_off + bblob_size;
 	L->payload_size = L->pblob_off + p_total * 8;
 }
 
@@ -163,10 +182,58 @@ static void wr16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 static void wr32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 static void wr64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 
-/* Per-bucket entry collection + radix sort by raw key (== key>>1 order). */
-typedef struct { uint64_t k, v; } tcache_pair_t;
-#define sort_key_tcp(a) ((a).k)
-KRADIX_SORT_INIT(tcp, tcache_pair_t, sort_key_tcp, 8)
+/* Open-addressing table capacity for n entries: smallest power of two
+ * >= ceil(n / 0.75), minimum 8 — guarantees the load factor at dump time is
+ * <= 0.75, so a probe never scans a full table. ceil(n/0.75) == ceil(4n/3). */
+static uint32_t tcache_table_capacity(uint64_t n)
+{
+	uint64_t need = (n * 4 + 2) / 3;
+	uint32_t cap = 8;
+	while (cap < need && cap <= 0x40000000u) cap <<= 1;
+	assert(cap >= need); // a single bucket with > 0.75*2^31 entries is out of scope
+	return cap;
+}
+
+/* Probe-insert (key,value) into an open-addressing table. idx = (key>>1) &
+ * (capacity-1); advance while the bitmap bit is set. The stored key keeps its
+ * bit0 (the singleton flag); only key>>1 participates in hashing and
+ * comparison — identical to khash's idx_hash/idx_eq semantics. */
+static void tcache_probe_insert(uint64_t *slots, uint8_t *bm, uint32_t cap,
+                                uint64_t k, uint64_t v)
+{
+	uint32_t mask = cap - 1;
+	uint32_t idx = (uint32_t)((k >> 1) & mask);
+	while (bm[idx >> 3] & (1u << (idx & 7))) idx = (idx + 1) & mask;
+	slots[(size_t)idx << 1] = k;
+	slots[((size_t)idx << 1) + 1] = v;
+	bm[idx >> 3] |= (1u << (idx & 7));
+}
+
+/* Popcount the occupancy bitmap of a table with `cap` slots. The bucket tables
+ * are 8 + cap*16 + ceil(cap/8) bytes — NOT multiples of 8 — so `bm` may be
+ * misaligned and the last u64 word read may extend past this bucket's bitmap
+ * into the NEXT bucket's header. Only bits [0, cap) belong to this table: mask
+ * the high bits of the last word. (Misaligned u64 loads are fine on x86/ARM.) */
+#ifdef _MSC_VER
+#include <intrin.h>
+#define TC_POPCNT64(x) __popcnt64(x)
+#else
+#define TC_POPCNT64(x) __builtin_popcountll(x)
+#endif
+static uint32_t tcache_bitmap_popcount(const uint8_t *bm, uint32_t cap)
+{
+	uint32_t n = 0, nw = ((cap - 1) >> 6) + 1, i; // words covering bits [0, cap)
+	const uint64_t *w = (const uint64_t*)bm;
+	for (i = 0; i + 1 < nw; ++i)
+		n += (uint32_t)TC_POPCNT64(w[i]);
+	{
+		uint32_t rem = cap & 63;
+		uint64_t last = w[nw - 1];
+		if (rem) last &= (1ULL << rem) - 1; // clear bits >= cap in the last word
+		n += (uint32_t)TC_POPCNT64(last);
+	}
+	return n;
+}
 
 /* Write `n` bytes from `buf` and feed them to the running CRC. */
 static int tcache_write(FILE *fp, mm_crc32c_s *crc, const void *buf, size_t n)
@@ -179,25 +246,30 @@ static int tcache_write(FILE *fp, mm_crc32c_s *crc, const void *buf, size_t n)
 int mm_tcache_dump(FILE *fp, const mm_idx_t *mi)
 {
 	uint64_t i, j, sum_len = 0, names_len = 0, n_entry = 0, p_total = 0;
+	uint64_t bblob_size = 0;
 	uint32_t has_seq = !(mi->flag & MM_I_NO_SEQ);
 	uint32_t has_names = !(mi->flag & MM_I_NO_NAME);
 	uint32_t n_bucket = 1U << mi->b;
-	uint64_t *ecount, *pcount;
+	uint64_t *ecount, *pcount, *bsize;
+	uint32_t *cap;
 	tcache_layout_t L;
 	mm_crc32c_s *crc = 0;
 	uint8_t hdr[TCACHE_HDR_SIZE];
 
 	if (fp == 0 || mi == 0) return -1;
 
-	/* pass A: sizes */
+	/* pass A: sizes; per-bucket table capacity + byte size follow from the
+	 * entry count (load factor target <= 0.75) */
+	ecount = (uint64_t*)calloc(n_bucket, 8);
+	pcount = (uint64_t*)calloc(n_bucket, 8);
+	bsize  = (uint64_t*)calloc(n_bucket, 8);
+	cap    = (uint32_t*)calloc(n_bucket, 4);
+	if (ecount == 0 || pcount == 0 || bsize == 0 || cap == 0) goto fail0;
 	for (i = 0; i < mi->n_seq; ++i) {
 		sum_len += mi->seq[i].len;
 		if (has_names && mi->seq[i].name)
 			names_len += 1 + strlen(mi->seq[i].name);
 	}
-	ecount = (uint64_t*)calloc(n_bucket, 8);
-	pcount = (uint64_t*)calloc(n_bucket, 8);
-	if (ecount == 0 || pcount == 0) goto fail0;
 	for (i = 0; i < n_bucket; ++i) {
 		const mm_idx_bucket_t *b = &mi->B[i];
 		ecount[i] = mi->is_tcache? (uint64_t)b->ne
@@ -205,8 +277,13 @@ int mm_tcache_dump(FILE *fp, const mm_idx_t *mi)
 		pcount[i] = (uint64_t)b->n;
 		n_entry += ecount[i];
 		p_total += pcount[i];
+		if (ecount[i]) {
+			cap[i] = tcache_table_capacity(ecount[i]);
+			bsize[i] = 8 + (uint64_t)cap[i] * 16 + ((uint64_t)cap[i] + 7) / 8;
+			bblob_size += bsize[i];
+		}
 	}
-	tcache_calc_layout(sum_len, has_seq, mi->n_seq, names_len, n_bucket, n_entry, p_total, &L);
+	tcache_calc_layout(sum_len, has_seq, mi->n_seq, names_len, n_bucket, bblob_size, p_total, &L);
 
 	/* header */
 	memset(hdr, 0, sizeof(hdr));
@@ -274,39 +351,49 @@ int mm_tcache_dump(FILE *fp, const mm_idx_t *mi)
 		if (tcache_write(fp, crc, &v, 8) != 0) goto fail;
 		if (i < n_bucket) j += pcount[i];
 	}
-	/* e_off table: cumulative (key,value) entry counts */
+	/* b_off table: cumulative byte offsets into the bucket blob */
 	for (i = 0, j = 0; i <= n_bucket; ++i) {
 		uint64_t v = j;
 		if (tcache_write(fp, crc, &v, 8) != 0) goto fail;
-		if (i < n_bucket) j += ecount[i];
+		if (i < n_bucket) j += bsize[i];
 	}
-	/* entries blob: per bucket, contiguous and sorted by key */
+	/* bucket blob: per bucket, an open-addressing table
+	 * (u32 capacity, u32 pad, slots[capacity*16], bitmap[ceil(capacity/8)]) */
 	for (i = 0; i < n_bucket; ++i) {
-		uint64_t c;
-		tcache_pair_t *pairs;
-		if (ecount[i] == 0) continue;
-		pairs = (tcache_pair_t*)malloc(ecount[i] * sizeof(tcache_pair_t));
-		if (pairs == 0) goto fail;
+		uint64_t c = ecount[i];
+		mm_idx_bucket_t *b = &mi->B[i];
+		uint64_t *slots;
+		uint8_t *bm, capbuf[8];
+		if (c == 0) continue;
+		slots = (uint64_t*)calloc(cap[i], 16);
+		bm = (uint8_t*)calloc(((size_t)cap[i] + 7) >> 3, 1);
+		if (slots == 0 || bm == 0) { free(slots); free(bm); goto fail; }
 		if (mi->is_tcache) {
-			// flat source: already sorted by construction
-			for (c = 0; c < ecount[i]; ++c) {
-				pairs[c].k = mi->B[i].fe[c<<1];
-				pairs[c].v = mi->B[i].fe[(c<<1)+1];
-			}
+			// v2 source (re-dump): iterate the occupied slots of the source table
+			uint32_t k, sbm_cap = b->cap;
+			const uint64_t *sfe = b->fe;
+			const uint8_t *sbm = b->bm;
+			for (k = 0; k < sbm_cap; ++k)
+				if (sbm[k >> 3] & (1u << (k & 7)))
+					tcache_probe_insert(slots, bm, cap[i], sfe[(size_t)k << 1], sfe[((size_t)k << 1) + 1]);
 		} else {
+			// traceon table source: insert in the table's iteration order
 			kmerindex_iter_t it;
 			uint64_t kk, vv;
-			kmerindex_iter_begin((const kmerindex_t*)mi->B[i].h, &it);
-			for (c = 0; kmerindex_iter_next(&it, &kk, &vv); ++c) {
-				pairs[c].k = kk;
-				pairs[c].v = vv;
+			uint32_t n = 0;
+			kmerindex_iter_begin((const kmerindex_t*)b->h, &it);
+			while (kmerindex_iter_next(&it, &kk, &vv)) {
+				tcache_probe_insert(slots, bm, cap[i], kk, vv);
+				++n;
 			}
-			assert(c == ecount[i]);
-			radix_sort_tcp(pairs, pairs + c);
+			assert(n == c);
 		}
-		if (fwrite(pairs, 16, ecount[i], fp) != ecount[i]) { free(pairs); goto fail; }
-		mm_crc32c_update(crc, pairs, ecount[i] * 16);
-		free(pairs);
+		wr32(capbuf, cap[i]);
+		wr32(capbuf + 4, 0);
+		if (tcache_write(fp, crc, capbuf, 8) != 0) { free(slots); free(bm); goto fail; }
+		if (tcache_write(fp, crc, slots, (size_t)cap[i] * 16) != 0) { free(slots); free(bm); goto fail; }
+		if (tcache_write(fp, crc, bm, ((size_t)cap[i] + 7) >> 3) != 0) { free(slots); free(bm); goto fail; }
+		free(slots); free(bm);
 	}
 	/* p_blob: concatenated per-bucket position arrays (already sorted) */
 	for (i = 0; i < n_bucket; ++i) {
@@ -335,13 +422,13 @@ int mm_tcache_dump(FILE *fp, const mm_idx_t *mi)
 		}
 	}
 	mm_crc32c_free(crc);
-	free(ecount); free(pcount);
+	free(ecount); free(pcount); free(bsize); free(cap);
 	return 0;
 
 fail:
 	mm_crc32c_free(crc);
 fail0:
-	free(ecount); free(pcount);
+	free(ecount); free(pcount); free(bsize); free(cap);
 	return -1;
 }
 
@@ -354,7 +441,7 @@ mm_idx_t *mm_tcache_load(FILE *fp)
 	tcache_layout_t L;
 	mm_idx_t *mi;
 	uint32_t n_bucket, has_seq, has_names, idx_flag;
-	uint64_t sum_len, n_entry, names_len, p_total;
+	uint64_t sum_len, n_entry, names_len, p_total, bblob_size;
 	uint32_t w, k, b, n_seq, i;
 	double t0, t_mmap, t_crc;
 
@@ -374,8 +461,19 @@ mm_idx_t *mm_tcache_load(FILE *fp)
 	t_mmap = realtime();
 
 	/* magic + version */
-	if (memcmp(map + TC_OFF_MAGIC, TCACHE_MAGIC, 4) != 0) goto fail;
-	if (rd16(map + TC_OFF_VERSION) != TCACHE_VERSION) goto fail;
+	if (memcmp(map + TC_OFF_MAGIC, TCACHE_MAGIC, 4) != 0) {
+		if (memcmp(map + TC_OFF_MAGIC, "TRC1", 4) == 0)
+			fprintf(stderr, "[ERROR] mm_tcache_load: %s is the obsolete TRC1 (v1) tcache format, which v2 cannot read; regenerate it with: minimap2 -d <ref>.tcache <ref>.fa\n",
+				"this file");
+		else
+			fprintf(stderr, "[ERROR] mm_tcache_load: not a tcache file (bad magic)\n");
+		goto fail;
+	}
+	if (rd16(map + TC_OFF_VERSION) != TCACHE_VERSION) {
+		fprintf(stderr, "[ERROR] mm_tcache_load: unsupported tcache format version %u (this build reads v%u); regenerate the file with: minimap2 -d <ref>.tcache <ref>.fa\n",
+			(unsigned)rd16(map + TC_OFF_VERSION), (unsigned)TCACHE_VERSION);
+		goto fail;
+	}
 
 	/* whole-file CRC32C trailer: covers [0, size-4) — TracEon v4 integrity pattern */
 	{
@@ -400,7 +498,12 @@ mm_idx_t *mm_tcache_load(FILE *fp)
 	if (b < 1 || b > 30) goto fail;                 // avoid 1U<<b overflow
 	if (n_bucket != 1U << b) goto fail;
 	if (n_seq != 0 && sum_len == 0) goto fail;      // sanity
-	tcache_calc_layout(sum_len, has_seq, n_seq, names_len, n_bucket, n_entry, p_total, &L);
+	/* The bucket-blob size is stored implicitly as b_off[n_bucket]; compute the
+	 * partial layout to locate the b_off table, read its last entry, then
+	 * recompute the full layout with the true blob size. */
+	tcache_calc_layout(sum_len, has_seq, n_seq, names_len, n_bucket, 0, p_total, &L);
+	bblob_size = rd64(map + L.boff_off + (uint64_t)n_bucket * 8);
+	tcache_calc_layout(sum_len, has_seq, n_seq, names_len, n_bucket, bblob_size, p_total, &L);
 	if (L.payload_size + 4 != size) goto fail;      // exact layout; CRC already guards content
 
 	mi = mm_idx_init(w, k, b, idx_flag);
@@ -433,19 +536,29 @@ mm_idx_t *mm_tcache_load(FILE *fp)
 	}
 	if (has_seq) mi->S = (uint32_t*)(map + L.s_off);
 
-	/* table block: point every bucket at its mmapped arrays — ZERO inserts */
+	/* table block: point every bucket at its mmapped slot array + occupancy
+	 * bitmap — ZERO inserts; the entry count comes from popcounting the bitmap */
 	{
 		const uint64_t *poff = (const uint64_t*)(map + L.poff_off);
-		const uint64_t *eoff = (const uint64_t*)(map + L.eoff_off);
-		const uint64_t *ent  = (const uint64_t*)(map + L.ent_off);
-		const uint64_t *pblob= (const uint64_t*)(map + L.pblob_off);
+		const uint64_t *boff = (const uint64_t*)(map + L.boff_off);
+		const uint8_t *bblob = map + L.bblob_off;
+		const uint64_t *pblob = (const uint64_t*)(map + L.pblob_off);
 		for (i = 0; i < n_bucket; ++i) {
 			mm_idx_bucket_t *b = &mi->B[i];
-			uint64_t pe = poff[i+1] - poff[i];
-			uint64_t ee = eoff[i+1] - eoff[i];
+			uint64_t pe = poff[i + 1] - poff[i];
+			uint64_t bs = boff[i + 1] - boff[i];
 			b->n = (int32_t)pe;
 			if (pe) b->p = (uint64_t*)(pblob + poff[i]);
-			if (ee) { b->fe = ent + (eoff[i]<<1); b->ne = (int32_t)ee; }
+			if (bs) {
+				const uint8_t *t = bblob + boff[i];
+				uint32_t cap = rd32(t);
+				uint64_t expect = 8 + (uint64_t)cap * 16 + ((uint64_t)cap + 7) / 8;
+				if (cap < 8 || (cap & (cap - 1)) != 0 || expect != bs) goto fail;
+				b->cap = cap;
+				b->fe = (const uint64_t*)(t + 8);
+				b->bm = t + 8 + (uint64_t)cap * 16;
+				b->ne = (int32_t)tcache_bitmap_popcount(b->bm, cap);
+			}
 		}
 	}
 

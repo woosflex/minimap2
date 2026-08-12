@@ -84,7 +84,7 @@ void mm_idx_destroy(mm_idx_t *mi)
 	if (mi->B) {
 #ifdef TRACEON_BACKEND
 		if (mi->is_tcache) {
-			// Flat mode: every bucket array (p, fe) and mi->S live inside the
+			// tcache v2: every bucket array (p, fe, bm) and mi->S live inside the
 			// mmap'd tcache region; nothing per-bucket is heap-owned.
 		} else
 #endif
@@ -130,25 +130,28 @@ const uint64_t *mm_idx_get(const mm_idx_t *mi, uint64_t minier, int *n)
 	void *h = b->h; // bucket handle: idxhash_t* (stock) or kmerindex_t* (traceon)
 	*n = 0;
 #ifdef TRACEON_BACKEND
-	if (mi->is_tcache) { // flat mode: binary search in the bucket's sorted (key,value) array
+	if (mi->is_tcache) { // v2: open-addressing hash probe over mmap'd slot arrays
 		const uint64_t *fe = b->fe;
-		if (fe == 0) return 0;
+		const uint8_t *bm = b->bm;
+		if (fe == 0 || bm == 0) return 0;
 		{
 			uint64_t key = minier>>mi->b; // == stored_key>>1 (the singleton bit is ignored, like idx_eq)
-			int32_t lo = 0, hi = b->ne;
-			while (lo < hi) {
-				int32_t mid = lo + ((hi - lo) >> 1);
-				if ((fe[mid<<1]>>1) < key) lo = mid + 1;
-				else hi = mid;
+			uint32_t cap = b->cap, mask = cap - 1;
+			uint32_t idx = (uint32_t)(key & mask);
+			while (bm[idx >> 3] & (1u << (idx & 7))) {
+				const uint64_t *slot = fe + ((size_t)idx << 1);
+				if ((slot[0] >> 1) == key) {
+					if (slot[0]&1) { // special casing when there is only one k-mer
+						*n = 1;
+						return &slot[1];
+					} else {
+						*n = (uint32_t)slot[1];
+						return &b->p[slot[1] >> 32];
+					}
+				}
+				idx = (idx + 1) & mask;
 			}
-			if (lo >= b->ne || (fe[lo<<1]>>1) != key) return 0; // miss
-			if (fe[lo<<1]&1) { // special casing when there is only one k-mer
-				*n = 1;
-				return &fe[(lo<<1)+1];
-			} else {
-				*n = (uint32_t)fe[(lo<<1)+1];
-				return &b->p[fe[(lo<<1)+1]>>32];
-			}
+			return 0; // unoccupied slot hit: miss
 		}
 	}
 #endif
@@ -194,7 +197,7 @@ void mm_idx_stat(const mm_idx_t *mi)
 	for (i = 0; i < 1U<<mi->b; ++i) {
 #ifdef TRACEON_BACKEND
 		if (mi->is_tcache) {
-			if (mi->B[i].fe) n += mi->B[i].ne;
+			n += mi->B[i].ne; // occupied slots only; ne is the bitmap popcount
 		} else
 #endif
 		if (mi->B[i].h) {
@@ -209,11 +212,15 @@ void mm_idx_stat(const mm_idx_t *mi)
 #ifdef TRACEON_BACKEND
 		if (mi->is_tcache) {
 			const uint64_t *fe = mi->B[i].fe;
-			int32_t j;
-			if (fe == 0) continue;
-			for (j = 0; j < mi->B[i].ne; ++j) {
-				sum += fe[j<<1]&1? 1 : (uint32_t)fe[(j<<1)+1];
-				if (fe[j<<1]&1) ++n1;
+			const uint8_t *bm = mi->B[i].bm;
+			uint32_t cap = mi->B[i].cap, j;
+			if (fe == 0 || bm == 0) continue;
+			for (j = 0; j < cap; ++j) { // scan bitmap + slots, occupied slots only
+				if (bm[j >> 3] & (1u << (j & 7))) {
+					uint64_t k = fe[(size_t)j << 1];
+					sum += k&1? 1 : (uint32_t)fe[((size_t)j << 1) + 1];
+					if (k&1) ++n1;
+				}
 			}
 		} else
 #endif
@@ -316,7 +323,7 @@ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f)
 	for (i = 0; i < 1<<mi->b; ++i) {
 #ifdef TRACEON_BACKEND
 		if (mi->is_tcache) {
-			if (mi->B[i].fe) n += mi->B[i].ne;
+			n += mi->B[i].ne; // occupied slots only
 		} else
 #endif
 		if (mi->B[i].h) {
@@ -333,10 +340,12 @@ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f)
 #ifdef TRACEON_BACKEND
 		if (mi->is_tcache) {
 			const uint64_t *fe = mi->B[i].fe;
-			int32_t j;
-			if (fe == 0) continue;
-			for (j = 0; j < mi->B[i].ne; ++j)
-				a[n++] = fe[j<<1]&1? 1 : (uint32_t)fe[(j<<1)+1];
+			const uint8_t *bm = mi->B[i].bm;
+			uint32_t cap = mi->B[i].cap, j;
+			if (fe == 0 || bm == 0) continue;
+			for (j = 0; j < cap; ++j) // scan bitmap + slots, occupied slots only
+				if (bm[j >> 3] & (1u << (j & 7)))
+					a[n++] = fe[(size_t)j << 1]&1? 1 : (uint32_t)fe[((size_t)j << 1) + 1];
 		} else
 #endif
 		if (mi->B[i].h == 0) continue;
@@ -660,11 +669,11 @@ mm_idx_t *mm_idx_str(int w, int k, int is_hpc, int bucket_bits, int n, const cha
  *************/
 
 #ifdef TRACEON_BACKEND
-// Rebuild a transient khash bucket from bucket i's entries in SORTED key order
-// (the order upstream inserts into khash after radix sorting b->a), so the .mmi
-// bytes we write are identical to stock for BOTH the traceon-table backend and
-// the tcache-flat backend. Returns NULL (with *size_out=0) for an empty bucket.
-// The caller destroys the returned khash.
+// Rebuild a transient khash bucket from bucket i's logical entries in SORTED
+// key order (the order upstream inserts into khash after radix sorting b->a), so
+// the .mmi bytes we write are identical to stock for BOTH the traceon-table
+// backend and the tcache v2 backend. Returns NULL (with *size_out=0) for an
+// empty bucket. The caller destroys the returned khash.
 static idxhash_t *mm_idx_bucket_khash(const mm_idx_t *mi, uint32_t i, uint32_t *size_out)
 {
 	mm_idx_bucket_t *b = &mi->B[i];
@@ -672,20 +681,35 @@ static idxhash_t *mm_idx_bucket_khash(const mm_idx_t *mi, uint32_t i, uint32_t *
 	uint32_t size = 0;
 	*size_out = 0;
 	if (mi->is_tcache) {
-		if (b->fe == 0) return 0;
+		// v2: collect the occupied slots (bitmap + slot array), sort by key
+		// (== by key>>1, since no bucket has two entries with equal key>>1) so
+		// the khash insertion order matches the stock build, then insert.
+		const uint64_t *fe = b->fe;
+		const uint8_t *bm = b->bm;
+		uint32_t cap = b->cap, j;
+		if (fe == 0 || bm == 0 || b->ne == 0) return 0;
 		size = (uint32_t)b->ne;
-		if (size == 0) return 0;
 		h = kh_init(idx);
 		kh_resize(idx, h, size);
 		{
-			uint32_t j;
-			for (j = 0; j < size; ++j) {
+			mm128_t *pairs = (mm128_t*)malloc((size_t)size * sizeof(mm128_t));
+			uint32_t c = 0;
+			for (j = 0; j < cap; ++j)
+				if (bm[j >> 3] & (1u << (j & 7))) {
+					pairs[c].x = fe[(size_t)j << 1];
+					pairs[c].y = fe[((size_t)j << 1) + 1];
+					++c;
+				}
+			assert(c == size);
+			radix_sort_128x(pairs, pairs + c);
+			for (j = 0; j < c; ++j) {
 				khint_t k;
 				int absent;
-				k = kh_put(idx, h, b->fe[j<<1], &absent);
+				k = kh_put(idx, h, pairs[j].x, &absent);
 				assert(absent);
-				kh_val(h, k) = b->fe[(j<<1)+1];
+				kh_val(h, k) = pairs[j].y;
 			}
+			free(pairs);
 		}
 	} else if (b->h) {
 		kmerindex_iter_t it;
@@ -874,6 +898,7 @@ int64_t mm_idx_is_idx(const char *fn)
 		if (ret == 4 && (strncmp(magic, MM_IDX_MAGIC, 4) == 0
 #ifdef TRACEON_BACKEND
 		                 || strncmp(magic, MM_TCACHE_MAGIC, 4) == 0
+		                 || strncmp(magic, "TRC1", 4) == 0 // obsolete v1; routed to the loader for a clear error
 #endif
 		                ))
 			is_idx = 1;
@@ -883,15 +908,17 @@ int64_t mm_idx_is_idx(const char *fn)
 }
 
 #ifdef TRACEON_BACKEND
-// True if the file begins with the TRC1 tcache magic (only called when
-// mm_idx_is_idx() already accepted the file).
+// True if the file begins with the TRC2 tcache magic (or the obsolete TRC1,
+// which is routed to the loader so it can report a clear version error) — only
+// called when mm_idx_is_idx() already accepted the file.
 static int mm_idx_is_tcache(const char *fn)
 {
 	int fd, ret = 0;
 	char magic[4];
 	fd = open(fn, O_RDONLY);
 	if (fd >= 0) {
-		if (read(fd, magic, 4) == 4 && strncmp(magic, MM_TCACHE_MAGIC, 4) == 0)
+		if (read(fd, magic, 4) == 4 &&
+		    (strncmp(magic, MM_TCACHE_MAGIC, 4) == 0 || strncmp(magic, "TRC1", 4) == 0))
 			ret = 1;
 		close(fd);
 	}
