@@ -8,6 +8,24 @@ PROG=		minimap2
 PROG_EXTRA=	sdust minimap2-lite
 LIBS=		-lm -lz -lpthread
 
+# --- TracEon backend (optional; default off) ---
+# TRACEON=1 backs minimap2's per-bucket khash_t(idx) minimizer table with
+# TracEon's traceon_kmer C API (libtraceon_kmer.a, see
+# https://github.com/woosflex/TracEon). All minimap2 objects still compile as
+# C (gcc); only the FINAL executable link is driven by the C++ driver ($(CXX))
+# so libstdc++/libtraceon_kmer symbols resolve. TRACEON_INC/TRACEON_LIB point
+# at the TracEon include dir and build dir and are overridable on the command
+# line. `make TRACEON=1 clean && make TRACEON=1` builds the traceon binary;
+# plain `make` stays byte-for-byte on the stock khash path.
+TRACEON ?= 0
+CXX ?= g++
+TRACEON_INC ?= $(HOME)/agent_workspace/TracEon/include
+TRACEON_LIB ?= $(HOME)/agent_workspace/TracEon/build
+ifeq ($(TRACEON),1)
+CPPFLAGS += -DTRACEON_BACKEND -I$(TRACEON_INC)
+LIBS += -L$(TRACEON_LIB) -ltraceon_kmer
+endif
+
 ifneq ($(aarch64),)
 	arm_neon=1
 endif
@@ -49,10 +67,18 @@ all:$(PROG)
 extra:all $(PROG_EXTRA)
 
 minimap2:main.o libminimap2.a
+ifeq ($(TRACEON),1)
+		$(CXX) $(CFLAGS) main.o -o $@ -L. -lminimap2 $(LIBS)
+else
 		$(CC) $(CFLAGS) main.o -o $@ -L. -lminimap2 $(LIBS)
+endif
 
 minimap2-lite:example.o libminimap2.a
+ifeq ($(TRACEON),1)
+		$(CXX) $(CFLAGS) $< -o $@ -L. -lminimap2 $(LIBS)
+else
 		$(CC) $(CFLAGS) $< -o $@ -L. -lminimap2 $(LIBS)
+endif
 
 libminimap2.a:$(OBJS)
 		$(AR) -csru $@ $(OBJS)

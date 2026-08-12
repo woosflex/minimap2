@@ -16,6 +16,10 @@
 #include "kvec.h"
 #include "khash.h"
 
+#ifdef TRACEON_BACKEND
+#include "kmerindex_c_api.h"
+#endif
+
 #define idx_hash(a) ((a)>>1)
 #define idx_eq(a, b) ((a)>>1 == (b)>>1)
 KHASH_INIT(idx, uint64_t, uint64_t, 1, idx_hash, idx_eq)
@@ -47,6 +51,20 @@ typedef struct mm_idx_jjump_s {
 	mm_idx_jjump1_t *a;
 } mm_idx_jjump_t;
 
+#ifdef TRACEON_BACKEND
+// Freeze every non-null bucket's traceon table so concurrent mapping-worker
+// lookups are safe: after freezing, kmerindex_insert()/reserve() fail, and
+// the interior pointers returned by kmerindex_get() stay stable. Called once
+// index generation completes (mm_idx_post) and after .mmi load, always before
+// any mapping worker reads the buckets.
+static void mm_idx_freeze_buckets(const mm_idx_t *mi)
+{
+	uint32_t i;
+	for (i = 0; i < 1U<<mi->b; ++i)
+		if (mi->B[i].h) kmerindex_freeze((kmerindex_t*)mi->B[i].h);
+}
+#endif
+
 mm_idx_t *mm_idx_init(int w, int k, int b, int flag)
 {
 	mm_idx_t *mi;
@@ -68,7 +86,11 @@ void mm_idx_destroy(mm_idx_t *mi)
 		for (i = 0; i < 1U<<mi->b; ++i) {
 			free(mi->B[i].p);
 			free(mi->B[i].a.a);
+#ifdef TRACEON_BACKEND
+			kmerindex_destroy((kmerindex_t*)mi->B[i].h);
+#else
 			kh_destroy(idx, (idxhash_t*)mi->B[i].h);
+#endif
 		}
 	}
 	if (mi->spsc) free(mi->spsc);
@@ -93,20 +115,38 @@ void mm_idx_destroy(mm_idx_t *mi)
 const uint64_t *mm_idx_get(const mm_idx_t *mi, uint64_t minier, int *n)
 {
 	int mask = (1<<mi->b) - 1;
-	khint_t k;
 	mm_idx_bucket_t *b = &mi->B[minier&mask];
-	idxhash_t *h = (idxhash_t*)b->h;
+	void *h = b->h; // bucket handle: idxhash_t* (stock) or kmerindex_t* (traceon)
 	*n = 0;
 	if (h == 0) return 0;
-	k = kh_get(idx, h, minier>>mi->b<<1);
-	if (k == kh_end(h)) return 0;
-	if (kh_key(h, k)&1) { // special casing when there is only one k-mer
-		*n = 1;
-		return &kh_val(h, k);
-	} else {
-		*n = (uint32_t)kh_val(h, k);
-		return &b->p[kh_val(h, k)>>32];
+#ifdef TRACEON_BACKEND
+	{
+		uint64_t matched_key;
+		const uint64_t *v = kmerindex_get((const kmerindex_t*)h, minier>>mi->b<<1, &matched_key);
+		if (v == 0) return 0; // miss
+		if (matched_key&1) { // special casing when there is only one k-mer
+			*n = 1;
+			return v;
+		} else {
+			*n = (uint32_t)*v;
+			return &b->p[*v>>32];
+		}
 	}
+#else
+	{
+		khint_t k;
+		idxhash_t *h2 = (idxhash_t*)h;
+		k = kh_get(idx, h2, minier>>mi->b<<1);
+		if (k == kh_end(h2)) return 0;
+		if (kh_key(h2, k)&1) { // special casing when there is only one k-mer
+			*n = 1;
+			return &kh_val(h2, k);
+		} else {
+			*n = (uint32_t)kh_val(h2, k);
+			return &b->p[kh_val(h2, k)>>32];
+		}
+	}
+#endif
 }
 
 void mm_idx_stat(const mm_idx_t *mi)
@@ -118,16 +158,36 @@ void mm_idx_stat(const mm_idx_t *mi)
 	for (i = 0; i < mi->n_seq; ++i)
 		len += mi->seq[i].len;
 	for (i = 0; i < 1U<<mi->b; ++i)
-		if (mi->B[i].h) n += kh_size((idxhash_t*)mi->B[i].h);
+		if (mi->B[i].h) {
+#ifdef TRACEON_BACKEND
+			n += (int64_t)kmerindex_size((const kmerindex_t*)mi->B[i].h);
+#else
+			n += kh_size((idxhash_t*)mi->B[i].h);
+#endif
+		}
 	for (i = 0; i < 1U<<mi->b; ++i) {
-		idxhash_t *h = (idxhash_t*)mi->B[i].h;
-		khint_t k;
-		if (h == 0) continue;
-		for (k = 0; k < kh_end(h); ++k)
-			if (kh_exist(h, k)) {
-				sum += kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
-				if (kh_key(h, k)&1) ++n1;
+		if (mi->B[i].h == 0) continue;
+#ifdef TRACEON_BACKEND
+		{
+			kmerindex_iter_t it;
+			uint64_t kk, vv;
+			kmerindex_iter_begin((const kmerindex_t*)mi->B[i].h, &it);
+			while (kmerindex_iter_next(&it, &kk, &vv)) {
+				sum += kk&1? 1 : (uint32_t)vv;
+				if (kk&1) ++n1;
 			}
+		}
+#else
+		{
+			idxhash_t *h = (idxhash_t*)mi->B[i].h;
+			khint_t k;
+			for (k = 0; k < kh_end(h); ++k)
+				if (kh_exist(h, k)) {
+					sum += kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
+					if (kh_key(h, k)&1) ++n1;
+				}
+		}
+#endif
 	}
 	fprintf(stderr, "[M::%s::%.3f*%.2f] distinct minimizers: %ld (%.2f%% are singletons); average occurrences: %.3lf; average spacing: %.3lf; total length: %ld\n",
 			__func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0), (long)n, 100.0*n1/n, (double)sum / n, (double)len / sum, (long)len);
@@ -200,19 +260,37 @@ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f)
 	int i;
 	size_t n = 0;
 	uint32_t thres;
-	khint_t *a, k;
+	uint32_t *a;
 	if (f <= 0.) return INT32_MAX;
 	for (i = 0; i < 1<<mi->b; ++i)
-		if (mi->B[i].h) n += kh_size((idxhash_t*)mi->B[i].h);
+		if (mi->B[i].h) {
+#ifdef TRACEON_BACKEND
+			n += kmerindex_size((const kmerindex_t*)mi->B[i].h);
+#else
+			n += kh_size((idxhash_t*)mi->B[i].h);
+#endif
+		}
 	if (n == 0) return INT32_MAX;
 	a = (uint32_t*)malloc(n * 4);
 	for (i = n = 0; i < 1<<mi->b; ++i) {
-		idxhash_t *h = (idxhash_t*)mi->B[i].h;
-		if (h == 0) continue;
-		for (k = 0; k < kh_end(h); ++k) {
-			if (!kh_exist(h, k)) continue;
-			a[n++] = kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
+		if (mi->B[i].h == 0) continue;
+#ifdef TRACEON_BACKEND
+		{
+			kmerindex_iter_t it;
+			uint64_t kk, vv;
+			kmerindex_iter_begin((const kmerindex_t*)mi->B[i].h, &it);
+			while (kmerindex_iter_next(&it, &kk, &vv))
+				a[n++] = kk&1? 1 : (uint32_t)vv;
 		}
+#else
+		{
+			idxhash_t *h = (idxhash_t*)mi->B[i].h;
+			khint_t k;
+			for (k = 0; k < kh_end(h); ++k)
+				if (kh_exist(h, k))
+					a[n++] = kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
+		}
+#endif
 	}
 	thres = ks_ksmall_uint32_t(n, a, (uint32_t)((1. - f) * n)) + 1;
 	free(a);
@@ -227,7 +305,11 @@ static void worker_post(void *g, long i, int tid)
 {
 	int n, n_keys;
 	size_t j, start_a, start_p;
+#ifdef TRACEON_BACKEND
+	kmerindex_t *h;
+#else
 	idxhash_t *h;
+#endif
 	mm_idx_t *mi = (mm_idx_t*)g;
 	mm_idx_bucket_t *b = &mi->B[i];
 	if (b->a.n == 0) return;
@@ -243,16 +325,48 @@ static void worker_post(void *g, long i, int tid)
 			n = 1;
 		} else ++n;
 	}
+#ifdef TRACEON_BACKEND
+	h = kmerindex_create();
+	if (h == 0) {
+		fprintf(stderr, "[ERROR] kmerindex_create failed: %s\n", kmerindex_last_error(0));
+		exit(1);
+	}
+	if (kmerindex_reserve(h, n_keys) != 1) { // mirrors upstream kh_resize(idx, h, n_keys)
+		fprintf(stderr, "[ERROR] kmerindex_reserve(%ld) failed: %s\n", (long)n_keys, kmerindex_last_error(h));
+		exit(1);
+	}
+#else
 	h = kh_init(idx);
 	kh_resize(idx, h, n_keys);
+#endif
 	b->p = (uint64_t*)calloc(b->n, 8);
 
 	// create the hash table
 	for (j = 1, n = 1, start_a = start_p = 0; j <= b->a.n; ++j) {
 		if (j == b->a.n || b->a.a[j].x>>8 != b->a.a[j-1].x>>8) {
+			mm128_t *p = &b->a.a[j-1];
+#ifdef TRACEON_BACKEND
+			int r;
+			assert(j == start_a + n);
+			if (n == 1) {
+				// one-shot final key with the singleton bit set (mirrors upstream's
+				// kh_put(base) + kh_key |= 1 post-insert mutation)
+				r = kmerindex_insert(h, (p->x>>8>>mi->b<<1) | 1, p->y);
+			} else {
+				int k;
+				for (k = 0; k < n; ++k)
+					b->p[start_p + k] = b->a.a[start_a + k].y;
+				radix_sort_64(&b->p[start_p], &b->p[start_p + n]); // sort by position; needed as in-place radix_sort_128x() is not stable
+				r = kmerindex_insert(h, p->x>>8>>mi->b<<1, (uint64_t)start_p<<32 | n);
+				start_p += n;
+			}
+			if (r != 1) {
+				if (r == -1) fprintf(stderr, "[ERROR] kmerindex_insert: %s\n", kmerindex_last_error(h));
+				assert(r == 1); // 0 = base-key collision (mirrors upstream assert(absent)); -1 = exception (message above)
+			}
+#else
 			khint_t itr;
 			int absent;
-			mm128_t *p = &b->a.a[j-1];
 			itr = kh_put(idx, h, p->x>>8>>mi->b<<1, &absent);
 			assert(absent && j == start_a + n);
 			if (n == 1) {
@@ -266,6 +380,7 @@ static void worker_post(void *g, long i, int tid)
 				kh_val(h, itr) = (uint64_t)start_p<<32 | n;
 				start_p += n;
 			}
+#endif
 			start_a = j, n = 1;
 		} else ++n;
 	}
@@ -401,6 +516,9 @@ mm_idx_t *mm_idx_gen(mm_bseq_file_t *fp, int w, int k, int b, int flag, int mini
 		fprintf(stderr, "[M::%s::%.3f*%.2f] collected minimizers\n", __func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0));
 
 	mm_idx_post(pl.mi, n_threads);
+#ifdef TRACEON_BACKEND
+	mm_idx_freeze_buckets(pl.mi); // freeze all buckets before mapping workers start
+#endif
 	if (mm_verbose >= 3)
 		fprintf(stderr, "[M::%s::%.3f*%.2f] sorted minimizers\n", __func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0));
 
@@ -465,6 +583,9 @@ mm_idx_t *mm_idx_str(int w, int k, int is_hpc, int bucket_bits, int n, const cha
 	}
 	free(a.a);
 	mm_idx_post(mi, 1);
+#ifdef TRACEON_BACKEND
+	mm_idx_freeze_buckets(mi);
+#endif
 	return mi;
 }
 
@@ -495,18 +616,51 @@ void mm_idx_dump(FILE *fp, const mm_idx_t *mi)
 	for (i = 0; i < 1<<mi->b; ++i) {
 		mm_idx_bucket_t *b = &mi->B[i];
 		khint_t k;
+#ifdef TRACEON_BACKEND
+		// The traceon table is not byte-compatible with khash's slot layout, so
+		// rebuild a khash bucket from the traceon entries and write it exactly
+		// as upstream does: the .mmi stream keeps the SAME record format as
+		// stock (logical key/value pairs), and stock binaries can load it.
+		idxhash_t *h = 0;
+		uint32_t size = 0;
+		if (b->h) {
+			kmerindex_iter_t it;
+			uint64_t kk, vv;
+			size = (uint32_t)kmerindex_size((const kmerindex_t*)b->h);
+			if (size) {
+				int absent;
+				h = kh_init(idx);
+				kh_resize(idx, h, size);
+				kmerindex_iter_begin((const kmerindex_t*)b->h, &it);
+				while (kmerindex_iter_next(&it, &kk, &vv)) {
+					k = kh_put(idx, h, kk, &absent);
+					assert(absent);
+					kh_val(h, k) = vv;
+				}
+			}
+		}
+#else
 		idxhash_t *h = (idxhash_t*)b->h;
 		uint32_t size = h? h->size : 0;
+#endif
 		fwrite(&b->n, 4, 1, fp);
 		fwrite(b->p, 8, b->n, fp);
 		fwrite(&size, 4, 1, fp);
-		if (size == 0) continue;
+		if (size == 0) {
+#ifdef TRACEON_BACKEND
+			if (h) kh_destroy(idx, h);
+#endif
+			continue;
+		}
 		for (k = 0; k < kh_end(h); ++k) {
 			uint64_t x[2];
 			if (!kh_exist(h, k)) continue;
 			x[0] = kh_key(h, k), x[1] = kh_val(h, k);
 			fwrite(x, 8, 2, fp);
 		}
+#ifdef TRACEON_BACKEND
+		if (h) kh_destroy(idx, h);
+#endif
 	}
 	if (!(mi->flag & MM_I_NO_SEQ))
 		fwrite(mi->S, 4, (sum_len + 7) / 8, fp);
@@ -550,7 +704,7 @@ mm_idx_t *mm_idx_load(FILE *fp)
 		fread(b->p, 8, b->n, fp);
 		fread(&size, 4, 1, fp);
 		if (size == 0) continue;
-		b->h = h = kh_init(idx);
+		b->h = h = kh_init(idx); // read the stock .mmi via khash exactly as upstream
 		kh_resize(idx, h, size);
 		for (j = 0; j < size; ++j) {
 			uint64_t x[2];
@@ -560,11 +714,41 @@ mm_idx_t *mm_idx_load(FILE *fp)
 			assert(absent);
 			kh_val(h, k) = x[1];
 		}
+#ifdef TRACEON_BACKEND
+		// convert khash -> traceon per bucket, then destroy the khash copy
+		// (stock .mmi files load into the traceon backend; memory converges
+		// to the same logical table as a fresh traceon build)
+		{
+			kmerindex_t *th = kmerindex_create();
+			if (th == 0) {
+				fprintf(stderr, "[ERROR] kmerindex_create failed: %s\n", kmerindex_last_error(0));
+				exit(1);
+			}
+			if (kmerindex_reserve(th, size) != 1) {
+				fprintf(stderr, "[ERROR] kmerindex_reserve failed: %s\n", kmerindex_last_error(th));
+				exit(1);
+			}
+			for (k = 0; k < kh_end(h); ++k) {
+				int r;
+				if (!kh_exist(h, k)) continue;
+				r = kmerindex_insert(th, kh_key(h, k), kh_val(h, k));
+				if (r != 1) {
+					if (r == -1) fprintf(stderr, "[ERROR] kmerindex_insert: %s\n", kmerindex_last_error(th));
+					assert(r == 1);
+				}
+			}
+			kh_destroy(idx, h);
+			b->h = th;
+		}
+#endif
 	}
 	if (!(mi->flag & MM_I_NO_SEQ)) {
 		mi->S = (uint32_t*)malloc((sum_len + 7) / 8 * 4);
 		fread(mi->S, 4, (sum_len + 7) / 8, fp);
 	}
+#ifdef TRACEON_BACKEND
+	mm_idx_freeze_buckets(mi); // freeze after load, before mapping workers start
+#endif
 	return mi;
 }
 
